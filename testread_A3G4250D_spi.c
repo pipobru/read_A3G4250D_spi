@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
 #include <math.h>
+#include <stdbool.h>
 
 /* ── Registres ── */
 #define WHO_AM_I        0x0F
@@ -25,6 +26,94 @@
 #define PI 3.14159265358979323846   //Est qq part dans math.h mais on le redéfinit pour être sûr de sa précision
 
 #define CALCULANGLE    1    //Calcul angulaire à partir de la vitesse mesurée et de la frequence mesurée (dt)
+
+/*
+Fonction de filtrage de claude
+gyro_raw ──► [ - biais ] ──► gyro_corrected
+                  ▲                │
+                  │         < seuil de repos ?
+             BIAS_ALPHA              │
+                  │            oui ──► fige l'angle
+                  └── correction       + affine le biais
+                      progressive
+                                   non ──► intègre l'angle
+*/
+/* ─── Paramètres à ajuster selon votre capteur ─────────────────────────── */
+
+#define GYRO_NOISE_THRESHOLD   0.05f   // rad/s — seuil de détection du repos
+#define BIAS_ALPHA             0.002f  // vitesse d'adaptation du biais (0..1)
+#define BIAS_INIT_SAMPLES      200     // échantillons pour la calibration initiale
+
+/* ─── Structure d'état ──────────────────────────────────────────────────── */
+
+typedef struct {
+    float angle;          // angle intégré (rad)
+    float bias;           // biais estimé du gyro (rad/s)
+    float bias_acc;       // accumulateur pour calibration initiale
+    uint16_t init_count;  // compteur de calibration
+    bool  calibrated;     // calibration initiale terminée ?
+} GyroFilter;
+
+/* ─── Initialisation ────────────────────────────────────────────────────── */
+
+void gyro_filter_init(GyroFilter *f)
+{
+    f->angle       = 0.0f;
+    f->bias        = 0.0f;
+    f->bias_acc    = 0.0f;
+    f->init_count  = 0;
+    f->calibrated  = false;
+}
+
+/* ─── Mise à jour — appeler à chaque échantillon ────────────────────────── */
+/*                                                                            */
+/*  gyro_raw : lecture brute du capteur (rad/s)                              */
+/*  dt       : pas de temps depuis le dernier appel (secondes)               */
+/*  Retourne : angle estimé (rad)                                            */
+
+float gyro_filter_update(GyroFilter *f, float gyro_raw, float dt)
+{
+    /* ── Phase 1 : calibration initiale (capteur immobile au démarrage) ── */
+    if (!f->calibrated) {
+        f->bias_acc   += gyro_raw;
+        f->init_count += 1;
+
+        if (f->init_count >= BIAS_INIT_SAMPLES) {
+            f->bias      = f->bias_acc / (float)BIAS_INIT_SAMPLES;
+            f->calibrated = true;
+        }
+        return f->angle;   // on ne bouge pas encore
+    }
+
+    /* ── Phase 2 : correction du biais en temps réel ─────────────────── */
+    /*                                                                      */
+    /*  Si le capteur est quasi-immobile, la lecture brute ≈ biais pur.    */
+    /*  On affine l'estimation par un filtre passe-bas exponentiel.        */
+
+    float gyro_corrected = gyro_raw - f->bias;
+
+    if (fabsf(gyro_corrected) < GYRO_NOISE_THRESHOLD) {
+        /* Repos détecté : recalage du biais */
+        f->bias += BIAS_ALPHA * gyro_corrected;
+        gyro_corrected = 0.0f;   // on fige l'angle pendant le repos
+    }
+
+    /* ── Phase 3 : intégration ──────────────────────────────────────── */
+    f->angle += gyro_corrected * dt;
+
+    return f->angle;
+}
+
+/* ─── Remise à zéro de l'angle (sans toucher au biais) ─────────────────── */
+
+void gyro_filter_reset_angle(GyroFilter *f)
+{
+    f->angle = 0.0f;
+}
+/*
+Fin des fonctions de filtrage de claude
+*/
+
 
 /* ── SPI ── */
 static int fd;
@@ -127,8 +216,19 @@ int main(void) {
     //Recuperation heure de départ pour calcul dt
     clock_gettime(CLOCK_MONOTONIC, &t_prev); 
 
-    float cumulx = 0;
+    float cumulbrutx = 0, cumulbruty = 0, cumulbrutz = 0;
+    float cumulx = 0, cumuly = 0, cumulz = 0;
 
+    // Filtre pour limiter la dérive : estimation du biais gyro
+    float bias_x = 0.0f, bias_y = 0.0f, bias_z = 0.0f;
+    const float alpha = 0.001f; // Facteur d'adaptation du biais (petit pour convergence lente)
+    /*
+    Initialisation du filtrage de claude
+    */
+    GyroFilter filter;
+    gyro_filter_init(&filter);
+    
+ 
     while (1) {
         usleep(100000); // Attendre 100ms = 10Hz pour ne pas saturer le terminal
 
@@ -158,15 +258,46 @@ int main(void) {
             if (gy < 0.1f && gy > -0.1f) gy = 0.0f;
             if (gz < 0.1f && gz > -0.1f) gz = 0.0f;
 
+            //Filtre de claude
+            float angle_x_claude = gyro_filter_update(&filter, deg_s_to_rad_s(gx), dt/fss);
+            angle_x_claude = rad_to_deg(angle_x_claude);
+            float angle_y_claude = gyro_filter_update(&filter, deg_s_to_rad_s(gy), dt/fss);
+            angle_y_claude = rad_to_deg(angle_y_claude);
+            float angle_z_claude = gyro_filter_update(&filter, deg_s_to_rad_s(gz), dt/fss);
+            angle_z_claude = rad_to_deg(angle_z_claude);
+
+            // Filtre pour limiter la dérive : estimation et soustraction du biais (copilot)
+            bias_x = alpha * gx + (1.0f - alpha) * bias_x;
+            bias_y = alpha * gy + (1.0f - alpha) * bias_y;
+            bias_z = alpha * gz + (1.0f - alpha) * bias_z;
+
+            float gx_corr = gx - bias_x;
+            float gy_corr = gy - bias_y;
+            float gz_corr = gz - bias_z;
+
             if(CALCULANGLE){
                 float dtech = dt / fss; /* dt par échantillon */
-                angle_x = gx*dtech;
-                angle_y = gy*dtech;
-                angle_z = gz*dtech;
+                angle_x = gx_corr*dtech;
+                angle_y = gy_corr*dtech;
+                angle_z = gz_corr*dtech;
 
                 cumulx += angle_x; //Cumul de l'angle en X
+                cumuly += angle_y; //Cumul de l'angle en X
+                cumulz += angle_z; //Cumul de l'angle en X
 
-                printf("Angles →  X: %2.2f° | %2.2f°  Y: %2.2f°  Z: %2.2f° dt: %3.2fHz Nb echantillons: %2d\r", angle_x, cumulx, angle_y, angle_z, 1/dt, fss);
+                //Attention ici on va cumuler les erreurs de mesure, il faudrait faire un filtrage pour limiter la dérive (ex : filtre de Kalman, complément
+                cumulbrutx += gx*dtech;
+                cumulbruty += gy*dtech;
+                cumulbrutz += gz*dtech;
+
+                printf("Angles (aucun filtre) →                    X: %7.2f°/s  Y: %7.2f°/s  Z: %7.2f°/s dt: %7.4fHz Nb echantillons: %2d\n", 
+               cumulbrutx, cumulbruty, cumulbrutz, 1/dt, fss);
+                printf("Angles (filtre Copilot integre à l'IDE) →  X: %7.2f°/s  Y: %7.2f°/s  Z: %7.2f°/s dt: %7.4fHz Nb echantillons: %2d\n", 
+               cumulx, cumuly, cumulz, 1/dt, fss);
+                printf("Angles (filtre claude) →                   X: %7.2f°/s  Y: %7.2f°/s  Z: %7.2f°/s dt: %7.4fHz Nb echantillons: %2d\n", 
+               angle_x_claude, angle_y_claude, angle_z_claude, 1/dt, fss);
+               printf("\033[3A");
+
             }
             else{
                 printf("Angles →  X: %7.2f°/s  Y: %7.2f°/s  Z: %7.2f°/s dt: %7.4fHz Nb echantillons: %2d\r", 
