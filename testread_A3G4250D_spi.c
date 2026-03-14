@@ -26,6 +26,7 @@
 #define PI 3.14159265358979323846   //Est qq part dans math.h mais on le redéfinit pour être sûr de sa précision
 
 #define CALCULANGLE    1    //Calcul angulaire à partir de la vitesse mesurée et de la frequence mesurée (dt)
+#define LOGFILE        1    //Log dans un fichier pour analyse postérieure (ex : Excel)
 
 /*
 Fonction de filtrage de claude
@@ -227,7 +228,15 @@ int main(void) {
     */
     GyroFilter filter;
     gyro_filter_init(&filter);
-    
+
+    if(LOGFILE){
+        FILE *f = fopen("gyro_log.csv", "w");
+        if (f) {
+//            fprintf(f, "Time;RawX;RawY;RawZ;AngleX_Copilot;AngleY_Copilot;AngleZ_Copilot;AngleX_Claude;AngleY_Claude;AngleZ_Claude\n");
+            fprintf(f, "Time;RawX;AngleX_Copilot;AngleX_Claude;RawY;AngleY_Copilot;AngleY_Claude;RawZ;AngleZ_Copilot;AngleZ_Claude\n");
+            fclose(f);
+        }
+    }
  
     while (1) {
         usleep(100000); // Attendre 100ms = 10Hz pour ne pas saturer le terminal
@@ -244,6 +253,8 @@ int main(void) {
         float dt = (t_now.tv_sec  - t_prev.tv_sec)
                  + (t_now.tv_nsec - t_prev.tv_nsec) * 1e-9f; 
         t_prev = t_now;
+
+        float cumuldt = 0.0f; //Cumul du temps pour les échantillons traités dans ce cycle
  
         for (int i = 0; i < fss; i++) {
             uint8_t raw[6];
@@ -297,6 +308,23 @@ int main(void) {
                 printf("Angles (filtre claude) →                   X: %7.2f°/s  Y: %7.2f°/s  Z: %7.2f°/s dt: %7.4fHz Nb echantillons: %2d\n", 
                angle_x_claude, angle_y_claude, angle_z_claude, 1/dt, fss);
                printf("\033[3A");
+
+               if(LOGFILE){
+                    FILE *f = fopen("gyro_log.csv", "a");
+                    if (f) {
+                        cumuldt += dt;
+                        /*
+                        fprintf(f, "%f;%f;%f;%f;%f;%f;%f;%f;%f;%f\n", 
+                            cumuldt, gx, gy, gz, 
+                            cumulx, cumuly, cumulz, 
+                            angle_x_claude, angle_y_claude, angle_z_claude);*/
+                        fprintf(f, "%f;%f;%f;%f;%f;%f;%f;%f;%f;%f\n", 
+                            cumuldt, gx, cumulx, angle_x_claude,
+                            gy, cumuly, angle_y_claude,
+                            gz, cumulz, angle_z_claude);
+                        fclose(f);
+                    }
+                }
 
             }
             else{
